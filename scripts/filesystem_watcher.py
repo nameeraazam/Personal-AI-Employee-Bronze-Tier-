@@ -1,172 +1,114 @@
 #!/usr/bin/env python3
 """
-File system watcher for AI Employee Bronze Tier
-Monitors the Inbox folder and creates task files in Needs_Action when new files are detected.
+Bronze Tier Filesystem Watcher
+Monitors Inbox/ folder and processes new files automatically.
 """
 
+import sys
 import time
-import logging
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 import shutil
-from zoneinfo import ZoneInfo  # Python 3.9+
-import os
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 
-class InboxHandler:
-    def __init__(self, project_root: Path):
-        self.project_root = project_root
-        self.inbox_dir = project_root / "Inbox"
-        self.needs_action_dir = project_root / "Needs_Action"
+class InboxFileHandler(FileSystemEventHandler):
+    """Handles new file events in the Inbox folder."""
 
-        # Create directories if they don't exist
-        self.needs_action_dir.mkdir(exist_ok=True)
-        self.inbox_dir.mkdir(exist_ok=True)
+    def __init__(self, inbox_path, needs_action_path):
+        self.inbox_path = Path(inbox_path)
+        self.needs_action_path = Path(needs_action_path)
+        self.needs_action_path.mkdir(parents=True, exist_ok=True)
 
-        # Import watchdog here to handle the case where it's not installed
+    def on_created(self, event):
+        """Called when a file is created in the watched directory."""
+        if event.is_directory:
+            return
+
+        source_path = Path(event.src_path)
+
+        # Ignore temporary files and metadata files
+        if source_path.name.startswith('.') or source_path.suffix == '.tmp':
+            return
+
         try:
-            from watchdog.observers import Observer
-            from watchdog.events import FileSystemEventHandler
-            self.Observer = Observer
-            self.FileSystemEventHandler = FileSystemEventHandler
-        except ImportError:
-            logger.error("watchdog library is not installed. Please install it with: pip install watchdog")
-            raise
+            # Wait a moment to ensure file is fully written
+            time.sleep(0.5)
 
-    def on_file_created_or_moved(self, file_path: Path):
-        """Process a new file that was created or moved into Inbox."""
-        try:
-            # Only process files that are in the Inbox directory
-            if self.inbox_dir not in file_path.parents and file_path.parent != self.inbox_dir:
-                return
+            # Get file info
+            original_name = source_path.name
+            file_size = source_path.stat().st_size
+            detected_time = datetime.utcnow().isoformat() + 'Z'
 
-            original_name = file_path.name
-            logger.info(f"Detected new file: Inbox/{original_name}")
+            # Copy file to Needs_Action with FILE_ prefix
+            dest_filename = f"FILE_{original_name}"
+            dest_path = self.needs_action_path / dest_filename
 
-            # Get file size
-            try:
-                size_bytes = file_path.stat().st_size
-            except OSError as e:
-                logger.error(f"Could not get file size for {file_path}: {e}")
-                return
+            shutil.copy2(source_path, dest_path)
+            print(f"✓ Copied: {original_name} -> {dest_filename}")
 
-            # Generate timestamp in Asia/Karachi timezone
-            try:
-                karachi_tz = ZoneInfo("Asia/Karachi")
-                detected_at = datetime.now(karachi_tz).strftime("%Y-%m-%dT%H:%M:%S+05:00")
-            except Exception:
-                # Fallback to UTC if timezone is not available
-                detected_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            # Create metadata file
+            metadata_filename = f"FILE_{original_name}.md"
+            metadata_path = self.needs_action_path / metadata_filename
 
-            # Create new filename with FILE_ prefix
-            new_filename = f"FILE_{original_name}"
-            new_file_path = self.needs_action_dir / new_filename
-
-            # Copy the original file to Needs_Action/
-            try:
-                shutil.copy2(file_path, new_file_path)
-                logger.info(f"Copied original file to Needs_Action/{new_filename}")
-            except FileExistsError:
-                logger.warning(f"File already exists: {new_file_path}")
-                # Add a number suffix to make it unique
-                counter = 1
-                base_name = new_filename.rsplit('.', 1)[0] if '.' in new_filename else new_filename
-                extension = f".{new_filename.split('.', 1)[1]}" if '.' in new_filename else ""
-
-                while new_file_path.exists():
-                    new_filename = f"{base_name}_{counter}{extension}"
-                    new_file_path = self.needs_action_dir / new_filename
-                    counter += 1
-
-                shutil.copy2(file_path, new_file_path)
-                logger.info(f"Copied original file to Needs_Action/{new_filename} (with unique name)")
-            except PermissionError:
-                logger.error(f"Permission denied when copying {file_path} to {new_file_path}")
-                return
-            except Exception as e:
-                logger.error(f"Error copying {file_path} to {new_file_path}: {e}")
-                return
-
-            # Create the companion metadata file
             metadata_content = f"""---
 type: file_drop
 original_name: {original_name}
-size_bytes: {size_bytes}
-detected_at: {detected_at}
+size_bytes: {file_size}
+detected_at: {detected_time}
 status: pending
 ---
-
 ## Dropped File
-Original filename: {original_name}
-Copied to: {new_filename}
+Original: {original_name}
+Copied to: {dest_filename}
 
-New item ready for AI agent processing.
+New item ready for processing.
 """
 
-            metadata_file_path = self.needs_action_dir / f"{new_filename}.md"
-            try:
-                with open(metadata_file_path, 'w', encoding='utf-8') as f:
-                    f.write(metadata_content)
-                logger.info(f"Created task: Needs_Action/{new_filename}.md")
-            except PermissionError:
-                logger.error(f"Permission denied when creating metadata file: {metadata_file_path}")
-            except Exception as e:
-                logger.error(f"Error creating metadata file {metadata_file_path}: {e}")
+            metadata_path.write_text(metadata_content, encoding='utf-8')
+            print(f"✓ Created metadata: {metadata_filename}")
 
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-
-    def run(self):
-        """Start the file system watcher."""
-        from watchdog.observers import Observer
-        from watchdog.events import FileSystemEventHandler
-
-        class Handler(FileSystemEventHandler):
-            def __init__(self, inbox_handler):
-                self.inbox_handler = inbox_handler
-
-            def on_created(self, event):
-                if event.is_directory:
-                    return
-                file_path = Path(event.src_path)
-                self.inbox_handler.on_file_created_or_moved(file_path)
-
-            def on_moved(self, event):
-                if event.is_directory:
-                    return
-                # Check if the destination is in the Inbox directory
-                dest_path = Path(event.dest_path)
-                if self.inbox_handler.inbox_dir in dest_path.parents or dest_path.parent == self.inbox_handler.inbox_dir:
-                    self.inbox_handler.on_file_created_or_moved(dest_path)
-
-        event_handler = Handler(self)
-        observer = Observer()
-        observer.schedule(event_handler, str(self.inbox_dir), recursive=False)
-
-        logger.info(f"Starting file system watcher for {self.inbox_dir}")
-        logger.info("Watching for new files in Inbox folder...")
-
-        observer.start()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Stopping file system watcher...")
-            observer.stop()
-        observer.join()
+            print(f"✗ Error processing {source_path.name}: {e}", file=sys.stderr)
 
 
 def main():
-    project_root = Path.cwd()
-    watcher = InboxHandler(project_root)
-    watcher.run()
+    """Main entry point for the filesystem watcher."""
+    # Get paths relative to script location
+    script_dir = Path(__file__).parent.parent
+    inbox_path = script_dir / "Inbox"
+    needs_action_path = script_dir / "Needs_Action"
+
+    # Ensure Inbox exists
+    inbox_path.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("Bronze Tier Filesystem Watcher")
+    print("=" * 60)
+    print(f"Watching: {inbox_path.absolute()}")
+    print(f"Output:   {needs_action_path.absolute()}")
+    print("Press Ctrl+C to stop")
+    print("=" * 60)
+
+    # Set up watchdog observer
+    event_handler = InboxFileHandler(inbox_path, needs_action_path)
+    observer = Observer()
+    observer.schedule(event_handler, str(inbox_path), recursive=False)
+
+    try:
+        observer.start()
+        print("✓ Watcher started successfully\n")
+
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n\nStopping watcher...")
+        observer.stop()
+
+    observer.join()
+    print("✓ Watcher stopped")
 
 
 if __name__ == "__main__":
